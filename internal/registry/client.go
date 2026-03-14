@@ -12,7 +12,7 @@ import (
 	"github.com/xtam-ai/xtam-cli/internal/manifest"
 )
 
-const defaultBaseURL = "https://registry.xtam.ai"
+const defaultBaseURL = "https://xtam-registry.mamdouh.workers.dev"
 
 // Client communicates with the XTAM registry worker.
 type Client struct {
