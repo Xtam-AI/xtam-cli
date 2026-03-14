@@ -1,0 +1,46 @@
+version: 2
+project_name: xtam
+
+builds:
+  - main: ./main.go
+    binary: xtam
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - darwin
+      - linux
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - -s -w
+      - -X github.com/xtam-ai/xtam-cli/cmd.Version={{.Version}}
+      - -X github.com/xtam-ai/xtam-cli/cmd.Commit={{.ShortCommit}}
+      - -X github.com/xtam-ai/xtam-cli/cmd.Date={{.Date}}
+      - -X github.com/xtam-ai/xtam-cli/internal/auth.ClientID={{.Env.GOOGLE_OAUTH_CLIENT_ID}}
+
+archives:
+  - format: tar.gz
+    name_template: "{{ .ProjectName }}-{{ .Version }}-{{ .Os }}-{{ .Arch }}"
+
+brews:
+  - repository:
+      owner: xtam-ai
+      name: homebrew-tap
+    directory: Formula
+    homepage: "https://xtam.ai"
+    description: "XTAM private artifact registry CLI"
+    license: "Proprietary"
+    install: |
+      bin.install "xtam"
+    test: |
+      assert_match "xtam", shell_output("#{bin}/xtam version")
+    post_install: |
+      ohai "Run 'xtam login' to authenticate with your @xtam.ai account"
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
