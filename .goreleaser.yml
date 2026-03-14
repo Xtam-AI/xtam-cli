@@ -18,6 +18,7 @@ builds:
       - -X github.com/xtam-ai/xtam-cli/cmd.Commit={{.ShortCommit}}
       - -X github.com/xtam-ai/xtam-cli/cmd.Date={{.Date}}
       - -X github.com/xtam-ai/xtam-cli/internal/auth.ClientID={{.Env.GOOGLE_OAUTH_CLIENT_ID}}
+      - -X github.com/xtam-ai/xtam-cli/internal/auth.ClientSecret={{.Env.GOOGLE_OAUTH_CLIENT_SECRET}}
 
 archives:
   - format: tar.gz

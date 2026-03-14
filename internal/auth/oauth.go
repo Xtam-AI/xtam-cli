@@ -2,35 +2,33 @@ package auth
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"os/exec"
 	"runtime"
 	"strings"
-	"time"
 )
 
 const (
-	googleDeviceEndpoint = "https://oauth2.googleapis.com/device/code"
-	googleTokenEndpoint  = "https://oauth2.googleapis.com/token"
-	scopes               = "openid email profile"
-	requiredDomain       = "xtam.ai"
+	googleAuthEndpoint  = "https://accounts.google.com/o/oauth2/v2/auth"
+	googleTokenEndpoint = "https://oauth2.googleapis.com/token"
+	scopes              = "openid email profile"
+	requiredDomain      = "xtam.ai"
 )
 
-// ClientID is set at build time via ldflags, or overridden by XTAM_OAUTH_CLIENT_ID env var.
-var ClientID = "PLACEHOLDER.apps.googleusercontent.com"
-
-type DeviceCodeResponse struct {
-	DeviceCode      string `json:"device_code"`
-	UserCode        string `json:"user_code"`
-	VerificationURL string `json:"verification_url"`
-	ExpiresIn       int    `json:"expires_in"`
-	Interval        int    `json:"interval"`
-}
+// ClientID and ClientSecret are set at build time via ldflags,
+// or overridden by env vars.
+var (
+	ClientID     = "PLACEHOLDER.apps.googleusercontent.com"
+	ClientSecret = "PLACEHOLDER"
+)
 
 type TokenResponse struct {
 	IDToken      string `json:"id_token"`
@@ -39,6 +37,7 @@ type TokenResponse struct {
 	ExpiresIn    int    `json:"expires_in"`
 	TokenType    string `json:"token_type"`
 	Error        string `json:"error,omitempty"`
+	ErrorDesc    string `json:"error_description,omitempty"`
 }
 
 type IDTokenClaims struct {
@@ -52,100 +51,148 @@ type IDTokenClaims struct {
 	Iss           string `json:"iss"`
 }
 
-// Login performs the Google OAuth device authorization flow.
-// It returns the token response only if the user's email is @xtam.ai.
+// Login performs the Google OAuth localhost redirect flow.
+// Opens the browser, starts a temporary local server to capture the callback,
+// exchanges the auth code for tokens, and verifies the @xtam.ai domain.
 func Login(ctx context.Context) (*TokenResponse, *IDTokenClaims, error) {
 	clientID := getClientID()
+	clientSecret := getClientSecret()
 
-	// Step 1: Request device code
-	resp, err := http.PostForm(googleDeviceEndpoint, url.Values{
-		"client_id": {clientID},
-		"scope":     {scopes},
-	})
+	// Find a free port
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
-		return nil, nil, fmt.Errorf("device code request failed: %w", err)
+		return nil, nil, fmt.Errorf("failed to start local server: %w", err)
 	}
-	defer resp.Body.Close()
+	port := listener.Addr().(*net.TCPAddr).Port
+	redirectURI := fmt.Sprintf("http://127.0.0.1:%d/callback", port)
 
-	var dcr DeviceCodeResponse
-	if err := json.NewDecoder(resp.Body).Decode(&dcr); err != nil {
-		return nil, nil, fmt.Errorf("failed to parse device code response: %w", err)
-	}
-
-	// Step 2: Show instructions to user
-	fmt.Printf("\n  Open this URL in your browser:\n\n    %s\n\n", dcr.VerificationURL)
-	fmt.Printf("  Enter code: %s\n\n", dcr.UserCode)
-	fmt.Println("  Waiting for authentication...")
-
-	openBrowser(dcr.VerificationURL)
-
-	// Step 3: Poll for token
-	interval := time.Duration(dcr.Interval) * time.Second
-	if interval < 5*time.Second {
-		interval = 5 * time.Second
-	}
-	deadline := time.Now().Add(time.Duration(dcr.ExpiresIn) * time.Second)
-
-	for time.Now().Before(deadline) {
-		select {
-		case <-ctx.Done():
-			return nil, nil, ctx.Err()
-		case <-time.After(interval):
-		}
-
-		tr, err := pollToken(clientID, dcr.DeviceCode)
-		if err != nil {
-			return nil, nil, err
-		}
-		if tr == nil {
-			continue // authorization_pending
-		}
-
-		// Verify the id_token domain
-		claims, err := ParseIDToken(tr.IDToken)
-		if err != nil {
-			return nil, nil, fmt.Errorf("invalid id_token: %w", err)
-		}
-
-		if claims.HD != requiredDomain {
-			return nil, nil, fmt.Errorf("access denied: email must be @%s (got %s)", requiredDomain, claims.Email)
-		}
-		if !claims.EmailVerified {
-			return nil, nil, fmt.Errorf("access denied: email %s is not verified", claims.Email)
-		}
-
-		return tr, claims, nil
+	// Generate state for CSRF protection
+	state, err := randomString(32)
+	if err != nil {
+		listener.Close()
+		return nil, nil, fmt.Errorf("failed to generate state: %w", err)
 	}
 
-	return nil, nil, fmt.Errorf("authentication timed out after %d seconds", dcr.ExpiresIn)
+	// Build Google OAuth URL
+	authURL := fmt.Sprintf("%s?client_id=%s&redirect_uri=%s&response_type=code&scope=%s&state=%s&access_type=offline&prompt=consent&hd=%s",
+		googleAuthEndpoint,
+		url.QueryEscape(clientID),
+		url.QueryEscape(redirectURI),
+		url.QueryEscape(scopes),
+		url.QueryEscape(state),
+		url.QueryEscape(requiredDomain),
+	)
+
+	// Channel to receive the auth code
+	codeCh := make(chan string, 1)
+	errCh := make(chan error, 1)
+
+	// Start local HTTP server
+	mux := http.NewServeMux()
+	mux.HandleFunc("/callback", func(w http.ResponseWriter, r *http.Request) {
+		// Verify state
+		if r.URL.Query().Get("state") != state {
+			errCh <- fmt.Errorf("OAuth state mismatch — possible CSRF attack")
+			w.Header().Set("Content-Type", "text/html")
+			fmt.Fprint(w, "<html><body><h2>Authentication failed</h2><p>State mismatch. Please try again.</p></body></html>")
+			return
+		}
+
+		// Check for error
+		if errParam := r.URL.Query().Get("error"); errParam != "" {
+			errCh <- fmt.Errorf("OAuth error: %s", errParam)
+			w.Header().Set("Content-Type", "text/html")
+			fmt.Fprintf(w, "<html><body><h2>Authentication failed</h2><p>%s</p></body></html>", errParam)
+			return
+		}
+
+		code := r.URL.Query().Get("code")
+		if code == "" {
+			errCh <- fmt.Errorf("no authorization code received")
+			w.Header().Set("Content-Type", "text/html")
+			fmt.Fprint(w, "<html><body><h2>Authentication failed</h2><p>No code received.</p></body></html>")
+			return
+		}
+
+		w.Header().Set("Content-Type", "text/html")
+		fmt.Fprint(w, `<html><body style="font-family: system-ui; text-align: center; padding: 60px;">
+			<h2>Authenticated!</h2>
+			<p>You can close this tab and return to the terminal.</p>
+		</body></html>`)
+
+		codeCh <- code
+	})
+
+	server := &http.Server{Handler: mux}
+	go func() {
+		if err := server.Serve(listener); err != http.ErrServerClosed {
+			errCh <- err
+		}
+	}()
+	defer server.Close()
+
+	// Open browser
+	fmt.Printf("\n  Opening browser to authenticate...\n")
+	fmt.Printf("  If the browser doesn't open, visit:\n\n    %s\n\n", authURL)
+	openBrowser(authURL)
+
+	// Wait for callback
+	var code string
+	select {
+	case code = <-codeCh:
+		// got it
+	case err := <-errCh:
+		return nil, nil, err
+	case <-ctx.Done():
+		return nil, nil, ctx.Err()
+	}
+
+	fmt.Println("  Exchanging code for token...")
+
+	// Exchange code for tokens
+	tr, err := exchangeCode(clientID, clientSecret, code, redirectURI)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	// Verify the id_token domain
+	claims, err := ParseIDToken(tr.IDToken)
+	if err != nil {
+		return nil, nil, fmt.Errorf("invalid id_token: %w", err)
+	}
+
+	if claims.HD != requiredDomain {
+		return nil, nil, fmt.Errorf("access denied: email must be @%s (got %s)", requiredDomain, claims.Email)
+	}
+	if !claims.EmailVerified {
+		return nil, nil, fmt.Errorf("access denied: email %s is not verified", claims.Email)
+	}
+
+	return tr, claims, nil
 }
 
-func pollToken(clientID, deviceCode string) (*TokenResponse, error) {
+func exchangeCode(clientID, clientSecret, code, redirectURI string) (*TokenResponse, error) {
 	resp, err := http.PostForm(googleTokenEndpoint, url.Values{
-		"client_id":   {clientID},
-		"device_code": {deviceCode},
-		"grant_type":  {"urn:ietf:params:oauth:grant-type:device_code"},
+		"client_id":     {clientID},
+		"client_secret": {clientSecret},
+		"code":          {code},
+		"redirect_uri":  {redirectURI},
+		"grant_type":    {"authorization_code"},
 	})
 	if err != nil {
-		return nil, nil // retry on network error
+		return nil, fmt.Errorf("token exchange failed: %w", err)
 	}
 	defer resp.Body.Close()
 
 	var tr TokenResponse
 	if err := json.NewDecoder(resp.Body).Decode(&tr); err != nil {
-		return nil, nil
+		return nil, fmt.Errorf("failed to parse token response: %w", err)
+	}
+	if tr.Error != "" {
+		return nil, fmt.Errorf("token error: %s (%s)", tr.Error, tr.ErrorDesc)
 	}
 
-	switch tr.Error {
-	case "":
-		return &tr, nil
-	case "authorization_pending":
-		return nil, nil
-	case "slow_down":
-		return nil, nil
-	default:
-		return nil, fmt.Errorf("oauth error: %s", tr.Error)
-	}
+	return &tr, nil
 }
 
 // ParseIDToken decodes the JWT payload without signature verification.
@@ -157,7 +204,6 @@ func ParseIDToken(idToken string) (*IDTokenClaims, error) {
 	}
 
 	payload := parts[1]
-	// Add padding if needed
 	switch len(payload) % 4 {
 	case 2:
 		payload += "=="
@@ -181,8 +227,10 @@ func ParseIDToken(idToken string) (*IDTokenClaims, error) {
 // RefreshIDToken uses a refresh token to get a new id_token.
 func RefreshIDToken(refreshToken string) (*TokenResponse, error) {
 	clientID := getClientID()
+	clientSecret := getClientSecret()
 	resp, err := http.PostForm(googleTokenEndpoint, url.Values{
 		"client_id":     {clientID},
+		"client_secret": {clientSecret},
 		"refresh_token": {refreshToken},
 		"grant_type":    {"refresh_token"},
 	})
@@ -203,15 +251,25 @@ func RefreshIDToken(refreshToken string) (*TokenResponse, error) {
 }
 
 func getClientID() string {
-	// Allow override via environment for development
-	if id := lookupEnv("XTAM_OAUTH_CLIENT_ID"); id != "" {
+	if id := os.Getenv("XTAM_OAUTH_CLIENT_ID"); id != "" {
 		return id
 	}
 	return ClientID
 }
 
-func lookupEnv(key string) string {
-	return os.Getenv(key)
+func getClientSecret() string {
+	if s := os.Getenv("XTAM_OAUTH_CLIENT_SECRET"); s != "" {
+		return s
+	}
+	return ClientSecret
+}
+
+func randomString(n int) (string, error) {
+	b := make([]byte, n)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(b), nil
 }
 
 func openBrowser(url string) {
