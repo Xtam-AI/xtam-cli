@@ -29,12 +29,35 @@ func (s *SkillInstaller) Install(m *manifest.Manifest, archivePath string) (stri
 		targetDir = filepath.Join(home, ".claude", "skills", skillName)
 	}
 
+	// Preserve user-generated config files across updates
+	userFiles := []string{
+		"config/user_config.json",
+		"config/user_allowlist.json",
+		"config/preferences.json",
+	}
+	preserved := make(map[string][]byte)
+	for _, uf := range userFiles {
+		path := filepath.Join(targetDir, uf)
+		if data, err := os.ReadFile(path); err == nil {
+			preserved[uf] = data
+		}
+	}
+
 	// Remove existing
 	os.RemoveAll(targetDir)
 
 	// Extract tar.gz
 	if err := extractTarGz(archivePath, targetDir); err != nil {
 		return "", fmt.Errorf("failed to extract skill: %w", err)
+	}
+
+	// Restore preserved user files
+	for uf, data := range preserved {
+		path := filepath.Join(targetDir, uf)
+		os.MkdirAll(filepath.Dir(path), 0755)
+		if err := os.WriteFile(path, data, 0600); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: could not restore %s: %v\n", uf, err)
+		}
 	}
 
 	return targetDir, nil
